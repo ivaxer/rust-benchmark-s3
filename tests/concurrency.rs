@@ -36,7 +36,7 @@ const TASK_PAYLOAD_LENGTH: usize = 134_422_528;
 // These errors don't necessarily occur when actually running against S3 with concurrency levels
 // above 129. You can test it for yourself by running the
 // `test_concurrency_put_object_against_live` test that appears at the bottom of this file.
-const CONCURRENCY_LIMIT: usize = 30;
+const CONCURRENCY_LIMIT: usize = 64;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_concurrency_http1() {
@@ -106,10 +106,14 @@ async fn run_test(http_client: SharedHttpClient) {
 
     let bucket_name = env::var("BENCH_BUCKET_NAME").unwrap();
 
-    run_concurrency(bucket_name, sdk_config).await;
+    let mut concurrency_limit = 1;
+    while concurrency_limit <= CONCURRENCY_LIMIT {
+        run_concurrency(bucket_name.clone(), sdk_config.clone(), concurrency_limit).await;
+        concurrency_limit *= 2;
+    }
 }
 
-async fn run_concurrency(bucket_name: String, sdk_config: SdkConfig) {
+async fn run_concurrency(bucket_name: String, sdk_config: SdkConfig, concurrency_limit: usize) {
     let client = Client::new(&sdk_config);
 
     let histogram =
@@ -119,9 +123,11 @@ async fn run_concurrency(bucket_name: String, sdk_config: SdkConfig) {
 
     let path = generate_test_file().unwrap();
 
+    let test_start = Instant::now();
+
     println!("creating futures");
-    // This semaphore ensures we only run up to <CONCURRENCY_LIMIT> requests at once.
-    let semaphore = Arc::new(Semaphore::new(CONCURRENCY_LIMIT));
+    // This semaphore ensures we only run up to <concurrency_limit> requests at once.
+    let semaphore = Arc::new(Semaphore::new(concurrency_limit));
     let futures = (0..TASK_COUNT).map(|i| {
         let client = client.clone();
         let key = format!("concurrency/test_object_{:05}", i);
@@ -163,6 +169,12 @@ async fn run_concurrency(bucket_name: String, sdk_config: SdkConfig) {
     let res: Vec<_> = ::futures_util::future::join_all(futures).await;
     // Assert we ran all the tasks
     assert_eq!(TASK_COUNT, res.len());
+
+    println!(
+        "Concurrency limit: {}, duration: {} seconds",
+        concurrency_limit,
+        test_start.elapsed().as_secs()
+    );
 
     display_metrics(
         "Request Latency",
