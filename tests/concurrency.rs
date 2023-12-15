@@ -9,8 +9,8 @@ use aws_config;
 use aws_config::timeout::TimeoutConfig;
 use aws_sdk_s3::Client;
 use aws_smithy_runtime::client::http::hyper_014::HyperClientBuilder;
+use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
-use aws_types::sdk_config::SharedHttpClient;
 use aws_types::SdkConfig;
 
 use hdrhistogram::sync::SyncHistogram;
@@ -20,6 +20,7 @@ use hyper_rustls;
 use std::env;
 use std::sync::Arc;
 
+use tokio::fs;
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, Instant};
 
@@ -38,55 +39,142 @@ const TASK_PAYLOAD_LENGTH: usize = 134_422_528;
 // above 129. You can test it for yourself by running the
 // `test_concurrency_put_object_against_live` test that appears at the bottom of this file.
 const CONCURRENCY_LIMIT: usize = 64;
+// Size of buffer used to read file (in bytes)
+const BUFFER_SIZE: usize = 32_784;
+
+#[derive(Debug)]
+enum ByteStreamType {
+    FromPath,
+    ReadFrom,
+    SdkBody,
+}
+
+#[derive(Debug)]
+enum Protocol {
+    Http1,
+    Http2,
+}
+
+struct TestParams {
+    task_count: usize,
+    payload_length: usize,
+    concurrency_initial: usize,
+    concurrency_step: usize,
+    concurrency_limit: usize,
+    byte_stream_type: ByteStreamType,
+    protocol: Protocol,
+    buffer_size: usize,
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_concurrency_http1() {
-    let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_native_roots()
-        .https_only()
-        .enable_http1()
-        .build();
+    let test_params = TestParams {
+        task_count: TASK_COUNT,
+        payload_length: TASK_PAYLOAD_LENGTH,
+        concurrency_initial: 1,
+        concurrency_step: 2,
+        concurrency_limit: CONCURRENCY_LIMIT,
+        byte_stream_type: ByteStreamType::ReadFrom,
+        protocol: Protocol::Http1,
+        buffer_size: BUFFER_SIZE,
+    };
 
-    let http_client = HyperClientBuilder::new().build(https_connector);
-
-    run_test(http_client).await;
+    run_test(test_params).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_concurrency_http2() {
-    let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_native_roots()
-        .https_only()
-        .enable_http2()
-        .build();
+    let test_params = TestParams {
+        task_count: TASK_COUNT,
+        payload_length: TASK_PAYLOAD_LENGTH,
+        concurrency_initial: 1,
+        concurrency_step: 2,
+        concurrency_limit: CONCURRENCY_LIMIT,
+        byte_stream_type: ByteStreamType::ReadFrom,
+        protocol: Protocol::Http2,
+        buffer_size: BUFFER_SIZE,
+    };
 
-    let http_client = HyperClientBuilder::new().build(https_connector);
-
-    run_test(http_client).await;
+    run_test(test_params).await;
 }
 
-async fn run_test(http_client: SharedHttpClient) {
-    let sdk_config = aws_config::from_env()
-        .timeout_config(
-            TimeoutConfig::builder()
-                .connect_timeout(Duration::from_secs(30))
-                .read_timeout(Duration::from_secs(30))
-                .build(),
-        )
-        .http_client(http_client)
-        .load()
-        .await;
+#[ignore = "ignore utility test"]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_concurrency_bytestream() {
+    for byte_stream_type in vec![
+        ByteStreamType::FromPath,
+        ByteStreamType::ReadFrom,
+        ByteStreamType::SdkBody,
+    ] {
+        println!("Start test with {:?}", byte_stream_type);
 
-    let bucket_name = env::var("BENCH_BUCKET_NAME").unwrap();
+        let test_params = TestParams {
+            task_count: 128,
+            payload_length: 1024 * 1024 * 1024,
+            concurrency_initial: 8,
+            concurrency_step: 4,
+            concurrency_limit: 32,
+            byte_stream_type: byte_stream_type,
+            protocol: Protocol::Http1,
+            buffer_size: BUFFER_SIZE,
+        };
 
-    let mut concurrency_limit = 1;
-    while concurrency_limit <= CONCURRENCY_LIMIT {
-        run_concurrency(bucket_name.clone(), sdk_config.clone(), concurrency_limit).await;
-        concurrency_limit *= 2;
+        run_test(test_params).await;
     }
 }
 
-async fn run_concurrency(bucket_name: String, sdk_config: SdkConfig, concurrency_limit: usize) {
+async fn run_test(test_params: TestParams) {
+    let http_client = match test_params.protocol {
+        Protocol::Http1 => {
+            let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
+                .with_native_roots()
+                .https_only()
+                .enable_http1()
+                .build();
+
+            HyperClientBuilder::new().build(https_connector)
+        }
+        Protocol::Http2 => {
+            let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
+                .with_native_roots()
+                .https_only()
+                .enable_http2()
+                .build();
+
+            HyperClientBuilder::new().build(https_connector)
+        }
+    };
+
+    let mut config_loader = aws_config::from_env()
+        .timeout_config(
+            TimeoutConfig::builder()
+                .connect_timeout(Duration::from_secs(120))
+                .read_timeout(Duration::from_secs(120))
+                .build(),
+        )
+        .http_client(http_client);
+
+    if let Ok(endpoint_url) = env::var("BENCH_ENDPOINT_URL") {
+        config_loader = config_loader.endpoint_url(endpoint_url);
+    }
+
+    let sdk_config = config_loader.load().await;
+
+    let bucket_name = env::var("BENCH_BUCKET_NAME").unwrap();
+
+    let mut concurrency_limit = test_params.concurrency_initial;
+    while concurrency_limit <= test_params.concurrency_limit {
+        run_concurrency(&test_params, &bucket_name, &sdk_config, concurrency_limit).await;
+        concurrency_limit += test_params.concurrency_step;
+    }
+}
+
+async fn run_concurrency(
+    test_params: &TestParams,
+    bucket_name: &String,
+    sdk_config: &SdkConfig,
+    concurrency_limit: usize,
+) {
     let client = Client::new(&sdk_config);
 
     let histogram =
@@ -94,14 +182,14 @@ async fn run_concurrency(bucket_name: String, sdk_config: SdkConfig, concurrency
             .unwrap()
             .into_sync();
 
-    let path = common::generate_test_file(TASK_PAYLOAD_LENGTH).unwrap();
+    let path = common::generate_test_file(test_params.payload_length).unwrap();
 
     let test_start = Instant::now();
 
     println!("creating futures");
     // This semaphore ensures we only run up to <concurrency_limit> requests at once.
     let semaphore = Arc::new(Semaphore::new(concurrency_limit));
-    let futures = (0..TASK_COUNT).map(|i| {
+    let futures = (0..test_params.task_count).map(|i| {
         let client = client.clone();
         let key = format!("concurrency/test_object_{:05}", i);
         // make a clone of the semaphore and the recorder that can live in the future
@@ -118,20 +206,44 @@ async fn run_concurrency(bucket_name: String, sdk_config: SdkConfig, concurrency
                 .await
                 .expect("we'll get one if we wait long enough");
 
-            let stream = ByteStream::from_path(path_clone).await.unwrap();
+            let stream = match test_params.byte_stream_type {
+                ByteStreamType::FromPath => ByteStream::from_path(path_clone).await.unwrap(),
+                ByteStreamType::ReadFrom => ByteStream::read_from()
+                    .path(path_clone)
+                    .buffer_size(test_params.buffer_size)
+                    .build()
+                    .await
+                    .unwrap(),
+                ByteStreamType::SdkBody => {
+                    let source_file = fs::File::open(path_clone).await.unwrap();
+
+                    let reader = tokio_util::io::ReaderStream::with_capacity(
+                        source_file,
+                        test_params.buffer_size,
+                    );
+                    let body = hyper::body::Body::wrap_stream(reader);
+                    ByteStream::new(SdkBody::from_body_0_4(body))
+                }
+            };
 
             let start = Instant::now();
 
             let res = client
                 .put_object()
                 .bucket(bucket_name_clone)
-                .key(key)
+                .key(key.clone())
                 .body(stream)
+                .content_length(test_params.payload_length.try_into().unwrap())
                 .send()
                 .await
                 .expect("request should succeed");
 
             histogram_recorder.saturating_record(start.elapsed().as_nanos() as u64);
+            println!(
+                "Uploaded key {} for: {}",
+                key,
+                start.elapsed().as_secs_f64()
+            );
             drop(permit);
 
             res
@@ -141,7 +253,7 @@ async fn run_concurrency(bucket_name: String, sdk_config: SdkConfig, concurrency
     println!("joining futures");
     let res: Vec<_> = ::futures_util::future::join_all(futures).await;
     // Assert we ran all the tasks
-    assert_eq!(TASK_COUNT, res.len());
+    assert_eq!(test_params.task_count, res.len());
 
     println!(
         "Concurrency limit: {}, duration: {} seconds",
@@ -160,7 +272,7 @@ async fn run_concurrency(bucket_name: String, sdk_config: SdkConfig, concurrency
 fn display_metrics(name: &str, mut h: SyncHistogram<u64>, unit: &str, scale: f64) {
     // Refreshing is required or else we won't see any results at all
     h.refresh();
-    println!("displaying {} results from {name} histogram", h.len());
+    println!("displaying {} results", h.len());
     println!(
         "{name}\n\
         \tmean:\t{:.1}{unit},\n\
