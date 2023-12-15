@@ -21,6 +21,8 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, Instant};
+use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::EnvFilter;
 
 // WARNING:
 // Depending on the settings bellow, you may run into errors related to "Too many open files".
@@ -93,6 +95,11 @@ fn generate_test_file() -> Result<PathBuf, BoxError> {
 }
 
 async fn run_test(http_client: SharedHttpClient) {
+    tracing_subscriber::fmt()
+        .with_span_events(FmtSpan::CLOSE)
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+
     let sdk_config = aws_config::from_env()
         .timeout_config(
             TimeoutConfig::builder()
