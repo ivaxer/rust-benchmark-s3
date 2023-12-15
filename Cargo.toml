@@ -9,6 +9,7 @@ edition = "2021"
 aws-config = { version = "1.0", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.0"
 aws-smithy-runtime = { version = "1.0", features = ["client", "connector-hyper-0-14-x"] }
+aws-smithy-types = "1.1"
 aws-types = "1.0"
 futures-util = { version = "0.3.16", default-features = false, features = ["alloc"] }
 hdrhistogram = "7.5.2"

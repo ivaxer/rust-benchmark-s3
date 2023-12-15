@@ -3,22 +3,23 @@
  * - https://github.com/smithy-lang/smithy-rs/blob/main/aws/sdk/integration-tests/s3/tests/concurrency.rs
  */
 
+mod common;
+
 use aws_config;
 use aws_config::timeout::TimeoutConfig;
-use aws_sdk_s3::error::BoxError;
-use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use aws_smithy_runtime::client::http::hyper_014::HyperClientBuilder;
+use aws_smithy_types::byte_stream::ByteStream;
+use aws_types::sdk_config::SharedHttpClient;
 use aws_types::SdkConfig;
 
-use aws_types::sdk_config::SharedHttpClient;
 use hdrhistogram::sync::SyncHistogram;
 use hdrhistogram::Histogram;
 use hyper_rustls;
+
 use std::env;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::sync::Arc;
+
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, Instant};
 
@@ -64,34 +65,6 @@ async fn test_concurrency_http2() {
     run_test(http_client).await;
 }
 
-fn generate_test_file() -> Result<PathBuf, BoxError> {
-    let path = format!("/dev/shm/s3_bench").into();
-
-    let mut yes_process = Command::new("yes")
-        .arg("01234567890abcdefghijklmnopqrstuvwxyz")
-        .stdout(Stdio::piped())
-        .spawn()?;
-
-    let mut head_process = Command::new("head")
-        .arg("-c")
-        .arg(format!("{}", TASK_PAYLOAD_LENGTH))
-        .stdin(yes_process.stdout.take().unwrap())
-        .stdout(Stdio::piped())
-        .spawn()?;
-
-    let mut file = std::fs::File::create(&path)?;
-    head_process.stdout.as_mut().unwrap();
-    std::io::copy(&mut head_process.stdout.take().unwrap(), &mut file)?;
-
-    let exit_status = head_process.wait()?;
-
-    if !exit_status.success() {
-        Err("failed to generate temp file")?
-    }
-
-    Ok(path)
-}
-
 async fn run_test(http_client: SharedHttpClient) {
     let sdk_config = aws_config::from_env()
         .timeout_config(
@@ -121,7 +94,7 @@ async fn run_concurrency(bucket_name: String, sdk_config: SdkConfig, concurrency
             .unwrap()
             .into_sync();
 
-    let path = generate_test_file().unwrap();
+    let path = common::generate_test_file(TASK_PAYLOAD_LENGTH).unwrap();
 
     let test_start = Instant::now();
 
