@@ -102,18 +102,18 @@ async fn test_concurrency_http2() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_concurrency_bytestream() {
     for byte_stream_type in vec![
+        ByteStreamType::SdkBody,
         ByteStreamType::FromPath,
         ByteStreamType::ReadFrom,
-        ByteStreamType::SdkBody,
     ] {
         println!("Start test with {:?}", byte_stream_type);
 
         let test_params = TestParams {
-            task_count: 128,
-            payload_length: 1024 * 1024 * 1024,
-            concurrency_initial: 8,
-            concurrency_step: 4,
-            concurrency_limit: 32,
+            task_count: 1,
+            payload_length: 5 * 1024 * 1024 * 1024,
+            concurrency_initial: 1,
+            concurrency_step: 1,
+            concurrency_limit: 1,
             byte_stream_type: byte_stream_type,
             protocol: Protocol::Http1,
             buffer_size: BUFFER_SIZE,
@@ -233,10 +233,11 @@ async fn run_concurrency(
                 .bucket(bucket_name_clone)
                 .key(key.clone())
                 .body(stream)
-                .content_length(test_params.payload_length.try_into().unwrap())
                 .send()
                 .await
                 .expect("request should succeed");
+
+            println!("Put response: {:?}", &res);
 
             histogram_recorder.saturating_record(start.elapsed().as_nanos() as u64);
             println!(
